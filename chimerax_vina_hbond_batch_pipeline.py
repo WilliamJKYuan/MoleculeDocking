@@ -26,6 +26,8 @@ The Shell pipeline passes paths through environment variables:
     CHIMERAX_RELAX_HBOND_CRITERIA
     CHIMERAX_PRINT_EACH_POSE
     CHIMERAX_KEEP_HBOND_DETAIL_FILES
+    CHIMERAX_HYDROPHOBIC_CONTACT_DISTANCE
+    CHIMERAX_HYDROPHOBIC_RESIDUES
 """
 
 from pathlib import Path
@@ -39,7 +41,7 @@ from chimerax.core.commands import run
 
 # ===================== DEFAULT USER SETTINGS =====================
 # These defaults are used only when the script is run directly without the shell pipeline.
-WORK_DIR = r"D:/workSpace/yuan/Autodock/ChimeraXAnalysis"
+WORK_DIR = r"[WORK DIR]"
 RECEPTOR_DIR = ""      # Empty = WORK_DIR
 DOCKING_DIR = ""       # Empty = WORK_DIR
 RECEPTORS = []         # Empty = auto-detect receptor_dir/*.pdbqt
@@ -50,6 +52,15 @@ PRINT_EACH_POSE = True
 KEEP_HBOND_DETAIL_FILES = False
 CLOSE_ALL_AT_START = True
 DEFAULT_OUTPUT_FILENAME = "vina_hbond_summary_with_progress.txt"
+
+# Operational definition of hydrophobic/aromatic contacts:
+# ligand carbon atoms within this distance (Angstrom) of receptor carbon atoms
+# belonging to the listed hydrophobic/aromatic residues.
+HYDROPHOBIC_CONTACT_DISTANCE = 4.2
+HYDROPHOBIC_RESIDUES = [
+    "ALA", "VAL", "LEU", "ILE", "MET", "PHE", "TRP", "PRO", "TYR", "CYS",
+    "HIS", "HID", "HIE", "HIP"
+]
 # ================================================================
 
 AA3 = {
@@ -73,6 +84,16 @@ def env_list(name, default):
     return [x.strip() for x in re.split(r"[,;\s]+", value) if x.strip()]
 
 
+def env_float(name, default):
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return float(default)
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return float(default)
+
+
 def effective_settings():
     work_dir = Path(os.environ.get("CHIMERAX_WORK_DIR", WORK_DIR)).expanduser()
     receptor_dir_raw = os.environ.get("CHIMERAX_RECEPTOR_DIR", RECEPTOR_DIR).strip()
@@ -83,6 +104,9 @@ def effective_settings():
 
     output_txt = os.environ.get("CHIMERAX_OUTPUT_TXT", OUTPUT_TXT).strip()
     receptors = env_list("CHIMERAX_RECEPTORS", RECEPTORS)
+    hydrophobic_residues = [
+        x.upper() for x in env_list("CHIMERAX_HYDROPHOBIC_RESIDUES", HYDROPHOBIC_RESIDUES)
+    ]
 
     return {
         "work_dir": work_dir,
@@ -93,6 +117,8 @@ def effective_settings():
         "relax": env_bool("CHIMERAX_RELAX_HBOND_CRITERIA", RELAX_HBOND_CRITERIA),
         "print_each_pose": env_bool("CHIMERAX_PRINT_EACH_POSE", PRINT_EACH_POSE),
         "keep_details": env_bool("CHIMERAX_KEEP_HBOND_DETAIL_FILES", KEEP_HBOND_DETAIL_FILES),
+        "hydrophobic_cutoff": env_float("CHIMERAX_HYDROPHOBIC_CONTACT_DISTANCE", HYDROPHOBIC_CONTACT_DISTANCE),
+        "hydrophobic_residues": hydrophobic_residues,
     }
 
 
@@ -384,6 +410,177 @@ def calculate_one_pose_hbonds(session, receptor_file, pose_file, hbond_file, rel
     return hbond_count, residues, data_lines
 
 
+
+
+def get_first_opened_model(open_result):
+    """Return the first model object from a ChimeraX open command result."""
+    if open_result is None:
+        return None
+    if isinstance(open_result, (list, tuple)) and len(open_result) > 0:
+        return open_result[0]
+    return open_result
+
+
+def atom_element_symbol(atom):
+    """Get an atom element symbol robustly; fall back to atom name when needed."""
+    symbol = ""
+    try:
+        symbol = atom.element.name
+    except Exception:
+        symbol = ""
+    if symbol:
+        return str(symbol).upper()
+
+    try:
+        name = str(atom.name).strip().upper()
+    except Exception:
+        return ""
+    # PDBQT atom names can include digits; use the leading alphabetic part as fallback.
+    m = re.match(r"[A-Z]+", name)
+    return m.group(0) if m else name[:1]
+
+
+def is_carbon_atom(atom):
+    return atom_element_symbol(atom) == "C"
+
+
+def atom_xyz(atom):
+    """Return atom coordinates in scene coordinates when available."""
+    try:
+        c = atom.scene_coord
+    except Exception:
+        c = atom.coord
+
+    # ChimeraX Point/Place-compatible objects are usually indexable, but x/y/z may also exist.
+    try:
+        return float(c[0]), float(c[1]), float(c[2])
+    except Exception:
+        return float(c.x), float(c.y), float(c.z)
+
+
+def residue_label_from_atom(atom):
+    """Format residue label as RES123 or RES123(A)."""
+    r = atom.residue
+    resname = str(r.name).upper()
+    resnum = str(r.number)
+    chain = ""
+    try:
+        chain = str(r.chain_id).strip()
+    except Exception:
+        chain = ""
+    label = f"{resname}{resnum}"
+    if chain:
+        label += f"({chain})"
+    return label
+
+
+def residue_sort_key(label):
+    m = re.search(r"-?\d+", str(label))
+    prefix = re.sub(r"\d.*", "", str(label))
+    number = int(m.group(0)) if m else 99999
+    return (prefix, number, str(label))
+
+
+def calculate_one_pose_hydrophobic_contacts(
+    session,
+    receptor_file,
+    pose_file,
+    cutoff=HYDROPHOBIC_CONTACT_DISTANCE,
+    hydrophobic_resnames=None,
+    contact_file=None,
+):
+    """
+    Identify receptor residues having hydrophobic/aromatic contacts with one ligand pose.
+
+    Operational definition:
+        ligand carbon atoms vs receptor carbon atoms in selected hydrophobic/aromatic residues
+        within cutoff Angstrom.
+
+    Returns:
+        contact_count, unique_receptor_residues, contact_lines
+    """
+    hydrophobic_resnames = {str(x).upper() for x in (hydrophobic_resnames or HYDROPHOBIC_RESIDUES)}
+    cutoff = float(cutoff)
+    cutoff2 = cutoff * cutoff
+
+    contact_lines = []
+    residues = set()
+
+    try:
+        run(session, "close all")
+
+        rec_result = run(session, f'open "{receptor_file}"')
+        lig_result = run(session, f'open "{pose_file}"')
+
+        rec_model = get_first_opened_model(rec_result)
+        lig_model = get_first_opened_model(lig_result)
+        if rec_model is None or lig_model is None:
+            raise RuntimeError("Failed to open receptor or ligand model for hydrophobic-contact analysis.")
+
+        rec_atoms = []
+        for a in rec_model.atoms:
+            try:
+                r = a.residue
+                if r is None:
+                    continue
+                if str(r.name).upper() not in hydrophobic_resnames:
+                    continue
+                if not is_carbon_atom(a):
+                    continue
+                rec_atoms.append(a)
+            except Exception:
+                continue
+
+        lig_atoms = []
+        for a in lig_model.atoms:
+            try:
+                if is_carbon_atom(a):
+                    lig_atoms.append(a)
+            except Exception:
+                continue
+
+        for la in lig_atoms:
+            lx, ly, lz = atom_xyz(la)
+            for ra in rec_atoms:
+                rx, ry, rz = atom_xyz(ra)
+                d2 = (lx - rx) ** 2 + (ly - ry) ** 2 + (lz - rz) ** 2
+                if d2 <= cutoff2:
+                    d = d2 ** 0.5
+                    res_label = residue_label_from_atom(ra)
+                    residues.add(res_label)
+                    contact_lines.append(
+                        f"{res_label}\t{ra.name}\t{la.name}\t{d:.3f}"
+                    )
+
+        residues_sorted = sorted(residues, key=residue_sort_key)
+        contact_lines = sorted(
+            contact_lines,
+            key=lambda x: (residue_sort_key(x.split("\t")[0]), float(x.split("\t")[-1])),
+        )
+
+        if contact_file is not None:
+            contact_file = Path(contact_file)
+            contact_file.parent.mkdir(parents=True, exist_ok=True)
+            header = [
+                "Hydrophobic/aromatic contact definition:\n",
+                f"Ligand carbon atoms within {cutoff:.2f} Angstrom of receptor carbon atoms in residues: "
+                + ", ".join(sorted(hydrophobic_resnames)) + "\n",
+                "Receptor_residue\tReceptor_atom\tLigand_atom\tDistance_A\n",
+            ]
+            if contact_lines:
+                contact_file.write_text("".join(header) + "\n".join(contact_lines) + "\n", encoding="utf-8")
+            else:
+                contact_file.write_text("".join(header) + "No hydrophobic/aromatic contacts found.\n", encoding="utf-8")
+
+        return len(contact_lines), residues_sorted, contact_lines
+
+    finally:
+        try:
+            run(session, "close all")
+        except Exception:
+            pass
+
+
 def energy_sort_key(row):
     return row["energy"] if row["energy"] is not None else 1e9
 
@@ -408,6 +605,8 @@ def main(session):
     relax = settings["relax"]
     print_each_pose = settings["print_each_pose"]
     keep_details = settings["keep_details"]
+    hydrophobic_cutoff = settings["hydrophobic_cutoff"]
+    hydrophobic_residues = settings["hydrophobic_residues"]
 
     if not work_dir.exists():
         log_msg(session, f"[ERROR] WORK_DIR does not exist: {work_dir}")
@@ -441,14 +640,16 @@ def main(session):
         pose_dir.mkdir(parents=True, exist_ok=True)
 
     log_msg(session, "=" * 80)
-    log_msg(session, "ChimeraX Vina H-bond batch analysis started")
+    log_msg(session, "ChimeraX Vina H-bond + hydrophobic-contact batch analysis started")
     log_msg(session, f"WORK_DIR: {work_dir}")
     log_msg(session, f"RECEPTOR_DIR: {receptor_dir}")
     log_msg(session, f"DOCKING_DIR: {docking_dir}")
     log_msg(session, f"Output TXT: {output_file}")
     log_msg(session, f"Receptors: {', '.join(receptors) if receptors else 'auto-detect'}")
     log_msg(session, f"Relax H-bond criteria: {relax}")
-    log_msg(session, f"Keep H-bond detail files: {keep_details}")
+    log_msg(session, f"Hydrophobic contact cutoff: {hydrophobic_cutoff:.2f} Angstrom")
+    log_msg(session, f"Hydrophobic/aromatic residues: {', '.join(hydrophobic_residues)}")
+    log_msg(session, f"Keep H-bond/contact detail files: {keep_details}")
 
     jobs = find_jobs(receptor_dir, docking_dir, receptors, pose_dir, session)
     total_pairs = len(jobs)
@@ -467,6 +668,7 @@ def main(session):
     all_rows = []
     selected_rows = []
     raw_hbond_blocks = []
+    raw_hydrophobic_blocks = []
     pose_counter = 0
     start_time = time.time()
 
@@ -499,6 +701,7 @@ def main(session):
                 )
 
             hbond_file = detail_dir / f"hbonds__{safe_name(rec)}__{safe_name(lig)}__pose_{pose['pose_index']:02d}.txt"
+            hydrophobic_file = detail_dir / f"hydrophobic__{safe_name(rec)}__{safe_name(lig)}__pose_{pose['pose_index']:02d}.txt"
 
             try:
                 hbond_count, residues, data_lines = calculate_one_pose_hbonds(
@@ -508,16 +711,37 @@ def main(session):
                     hbond_file=hbond_file,
                     relax=relax,
                 )
-                error = ""
+                hbond_error = ""
             except Exception as e:
                 hbond_count = 0
                 residues = []
                 data_lines = []
-                error = str(e)
+                hbond_error = str(e)
                 log_msg(session, f"[ERROR] H-bond failed: {rec} vs {lig}, pose {pose['pose_index']}: {e}")
                 log_msg(session, traceback.format_exc())
 
+            try:
+                hydro_count, hydro_residues, hydro_lines = calculate_one_pose_hydrophobic_contacts(
+                    session=session,
+                    receptor_file=job["receptor_file"],
+                    pose_file=pose["pose_file"],
+                    cutoff=hydrophobic_cutoff,
+                    hydrophobic_resnames=hydrophobic_residues,
+                    contact_file=hydrophobic_file,
+                )
+                hydro_error = ""
+            except Exception as e:
+                hydro_count = 0
+                hydro_residues = []
+                hydro_lines = []
+                hydro_error = str(e)
+                log_msg(session, f"[ERROR] Hydrophobic contacts failed: {rec} vs {lig}, pose {pose['pose_index']}: {e}")
+                log_msg(session, traceback.format_exc())
+
             residue_text = "; ".join(residues) if residues else "None"
+            hydro_residue_text = "; ".join(hydro_residues) if hydro_residues else "None"
+            error = "; ".join([x for x in [hbond_error, hydro_error] if x])
+
             row = {
                 "receptor": rec,
                 "ligand": lig,
@@ -525,7 +749,11 @@ def main(session):
                 "energy": energy,
                 "hbond_count": hbond_count,
                 "receptor_residues": residue_text,
+                "hydrophobic_contact_count": hydro_count,
+                "hydrophobic_residue_count": len(hydro_residues),
+                "hydrophobic_residues": hydro_residue_text,
                 "hbond_file": str(hbond_file) if keep_details else "temporary",
+                "hydrophobic_file": str(hydrophobic_file) if keep_details else "temporary",
                 "error": error,
                 "source_file": job["source_label"],
             }
@@ -539,7 +767,21 @@ def main(session):
                     + "\n"
                 )
 
-            log_msg(session, f"    -> H-bonds={hbond_count}; receptor residues={residue_text}", also_status=False)
+            if hydro_lines:
+                raw_hydrophobic_blocks.append(
+                    f"\n--- {rec} vs {lig} | pose {pose['pose_index']} | energy={energy_text} | "
+                    f"hydrophobic_contacts={hydro_count} | cutoff={hydrophobic_cutoff:.2f} A ---\n"
+                    + "Receptor_residue\tReceptor_atom\tLigand_atom\tDistance_A\n"
+                    + "\n".join(hydro_lines)
+                    + "\n"
+                )
+
+            log_msg(
+                session,
+                f"    -> H-bonds={hbond_count}; receptor residues={residue_text}; "
+                f"hydrophobic contacts={hydro_count}; hydrophobic residues={hydro_residue_text}",
+                also_status=False,
+            )
 
         with_hbond = [r for r in pair_rows if r["hbond_count"] > 0]
         if with_hbond:
@@ -555,35 +797,53 @@ def main(session):
             session,
             f"[SELECTED] {rec} vs {lig}: pose {selected['pose_index']}, "
             f"energy={selected_energy_text}, H-bonds={selected['hbond_count']}, "
-            f"rule={selected['selection_rule']}, residues={selected['receptor_residues']}",
+            f"rule={selected['selection_rule']}, residues={selected['receptor_residues']}, "
+            f"hydrophobic_contacts={selected['hydrophobic_contact_count']}, "
+            f"hydrophobic_residues={selected['hydrophobic_residues']}",
         )
 
     lines = []
-    lines.append("ChimeraX Vina H-bond batch summary\n")
+    lines.append("ChimeraX Vina H-bond + hydrophobic-contact batch summary\n")
     lines.append(f"WORK_DIR: {work_dir}\n")
     lines.append(f"RECEPTOR_DIR: {receptor_dir}\n")
     lines.append(f"DOCKING_DIR: {docking_dir}\n")
     lines.append(f"Total receptor-ligand pairs: {total_pairs}\n")
     lines.append(f"Total poses analyzed: {total_poses}\n")
     lines.append(f"Relax H-bond criteria: {relax}\n")
+    lines.append(f"Hydrophobic contact cutoff: {hydrophobic_cutoff:.2f} Angstrom\n")
+    lines.append("Hydrophobic/aromatic residues: " + ", ".join(hydrophobic_residues) + "\n")
     lines.append("\n")
 
     lines.append("===== SELECTED RESULT PER RECEPTOR-LIGAND PAIR =====\n")
-    lines.append("Receptor\tLigand\tSelected_pose\tEnergy_kcal_mol\tSelection_rule\tHbond_count\tReceptor_residues\tSource_file\n")
+    lines.append(
+        "Receptor\tLigand\tSelected_pose\tEnergy_kcal_mol\tSelection_rule\t"
+        "Hbond_count\tReceptor_residues\t"
+        "Hydrophobic_contact_count\tHydrophobic_residue_count\tHydrophobic_residues\tSource_file\n"
+    )
     for r in selected_rows:
         energy_text = "NA" if r["energy"] is None else f"{r['energy']:.3f}"
         lines.append(
             f"{r['receptor']}\t{r['ligand']}\t{r['pose_index']}\t{energy_text}\t"
-            f"{r['selection_rule']}\t{r['hbond_count']}\t{r['receptor_residues']}\t{r['source_file']}\n"
+            f"{r['selection_rule']}\t{r['hbond_count']}\t{r['receptor_residues']}\t"
+            f"{r['hydrophobic_contact_count']}\t{r['hydrophobic_residue_count']}\t"
+            f"{r['hydrophobic_residues']}\t{r['source_file']}\n"
         )
 
     lines.append("\n===== ALL POSE DETAILS =====\n")
-    lines.append("Receptor\tLigand\tPose\tEnergy_kcal_mol\tHbond_count\tReceptor_residues\tSource_file\tHbond_detail_file\tError\n")
+    lines.append(
+        "Receptor\tLigand\tPose\tEnergy_kcal_mol\t"
+        "Hbond_count\tReceptor_residues\t"
+        "Hydrophobic_contact_count\tHydrophobic_residue_count\tHydrophobic_residues\t"
+        "Source_file\tHbond_detail_file\tHydrophobic_detail_file\tError\n"
+    )
     for r in all_rows:
         energy_text = "NA" if r["energy"] is None else f"{r['energy']:.3f}"
         lines.append(
             f"{r['receptor']}\t{r['ligand']}\t{r['pose_index']}\t{energy_text}\t"
-            f"{r['hbond_count']}\t{r['receptor_residues']}\t{r['source_file']}\t{r['hbond_file']}\t{r['error']}\n"
+            f"{r['hbond_count']}\t{r['receptor_residues']}\t"
+            f"{r['hydrophobic_contact_count']}\t{r['hydrophobic_residue_count']}\t"
+            f"{r['hydrophobic_residues']}\t{r['source_file']}\t"
+            f"{r['hbond_file']}\t{r['hydrophobic_file']}\t{r['error']}\n"
         )
 
     lines.append("\n===== RAW HBOND LINES PARSED FROM CHIMERAX SAVEFILE =====\n")
@@ -592,10 +852,16 @@ def main(session):
     else:
         lines.append("No raw H-bond lines were parsed.\n")
 
+    lines.append("\n===== RAW HYDROPHOBIC/AROMATIC CONTACT LINES CALCULATED FROM COORDINATES =====\n")
+    if raw_hydrophobic_blocks:
+        lines.extend(raw_hydrophobic_blocks)
+    else:
+        lines.append("No hydrophobic/aromatic contact lines were calculated.\n")
+
     output_file.write_text("".join(lines), encoding="utf-8")
 
     log_msg(session, "=" * 80)
-    log_msg(session, "ChimeraX Vina H-bond batch analysis finished")
+    log_msg(session, "ChimeraX Vina H-bond + hydrophobic-contact batch analysis finished")
     log_msg(session, f"Results saved to: {output_file}")
     log_msg(session, "=" * 80)
 
