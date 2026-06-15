@@ -397,13 +397,13 @@ collect_chimerax_inputs() {  # 获取 ChimeraX 分析所需参数；正式运行
     read -r -p "受体名称（多个用逗号分隔；留空自动检测 receptor 目录中的 .pdbqt）: " CHIMERAX_RECEPTORS
     CHIMERAX_RECEPTORS=$(echo "$CHIMERAX_RECEPTORS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
-    default_txt="$DOCK_OUT_DIR_ABS/vina_hbond_summary_with_progress.txt"
+    default_txt="$DOCK_OUT_DIR_ABS/vina_hbond_hydrophobic_summary.txt"
     read -r -p "ChimeraX 结果 TXT [默认: $default_txt；输入目录时自动追加文件名]: " input
     input=$(normalize_path "$input")
     [ -z "$input" ] && input="$default_txt"
     out_abs=$(path_relative_or_absolute_to_workdir "$input")
     if [ -d "$out_abs" ]; then
-        out_abs="$out_abs/vina_hbond_summary_with_progress.txt"
+        out_abs="$out_abs/vina_hbond_hydrophobic_summary.txt"
     fi
     out_parent=$(dirname "$out_abs")
     mkdir -p "$out_parent" || { echo "错误: 无法创建ChimeraX输出目录: $out_parent"; return 1; }
@@ -844,10 +844,10 @@ collect_pymol_final_inputs() {  # 获取 PyMOL 最终可视化参数；输出默
 
     if [ -n "${CHIMERAX_OUTPUT_TXT_ABS:-}" ]; then
         default_summary="$CHIMERAX_OUTPUT_TXT_ABS"
-    elif [ -f "$WORK_DIR_ABS/Final/vina_hbond_summary_with_progress.txt" ]; then
-        default_summary="$WORK_DIR_ABS/Final/vina_hbond_summary_with_progress.txt"
+    elif [ -f "$WORK_DIR_ABS/Final/vina_hbond_hydrophobic_summary.txt" ]; then
+        default_summary="$WORK_DIR_ABS/Final/vina_hbond_hydrophobic_summary.txt"
     else
-        default_summary="$DOCK_OUT_DIR_ABS/vina_hbond_summary_with_progress.txt"
+        default_summary="$DOCK_OUT_DIR_ABS/vina_hbond_hydrophobic_summary.txt"
     fi
 
     read -r -p "PyMOL读取的ChimeraX结果TXT [默认: $default_summary]: " input
