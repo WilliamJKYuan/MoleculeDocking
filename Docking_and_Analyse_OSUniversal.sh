@@ -406,9 +406,9 @@ collect_chimerax_inputs() {  # 获取 ChimeraX 分析所需参数；正式运行
     mkdir -p "$out_parent" || { echo "错误: 无法创建ChimeraX输出目录: $out_parent"; return 1; }
     CHIMERAX_OUTPUT_TXT_ABS="$out_abs"
 
-    ask_yes_no_var CHIMERAX_RELAX_HBOND "是否使用宽松氢键判定标准（relax=true）？[Y/n]: " "y" || return 1
-    ask_yes_no_var CHIMERAX_PRINT_EACH_POSE "是否在 ChimeraX Log 中显示每个 pose 的进度？[Y/n]: " "y" || return 1
-    ask_yes_no_var CHIMERAX_KEEP_DETAILS "是否保留每个 pose 的氢键明细文件？[y/N]: " "n" || return 1
+    ask_yes_no_var CHIMERAX_RELAX_HBOND "是否使用宽松氢键判定标准（relax=true）？[Y/n]（默认y）: " "y" || return 1
+    ask_yes_no_var CHIMERAX_PRINT_EACH_POSE "是否在 ChimeraX Log 中显示每个 pose 的进度？[Y/n]（默认y）: " "y" || return 1
+    ask_yes_no_var CHIMERAX_KEEP_DETAILS "是否保留每个 pose 的氢键明细文件？[y/N]（默认n）: " "n" || return 1
 }
 
 ask_work_dir_once() {  # 工作目录只询问一次
@@ -474,16 +474,16 @@ collect_all_inputs() {  # 所有需要询问的内容集中放在正式运行之
     fi
 
     if [ "$can_run_chimerax_after" -eq 1 ]; then
-        ask_yes_no_var RUN_CHIMERAX_AFTER "Vina 对接完成后是否继续运行 ChimeraX 氢键分析？[Y/n]: " "y" || return 1
+        ask_yes_no_var RUN_CHIMERAX_AFTER "Vina 对接完成后是否继续运行 ChimeraX 氢键分析？[Y/n]（默认y）: " "y" || return 1
         if [ "$RUN_CHIMERAX_AFTER" -eq 1 ]; then
             need_chimerax=1
-            ask_yes_no_var RUN_PYMOL_FINAL_AFTER "ChimeraX 氢键分析完成后是否继续运行 PyMOL 最终可视化？[y/N]: " "n" || return 1
+            ask_yes_no_var RUN_PYMOL_FINAL_AFTER "ChimeraX 氢键分析完成后是否继续运行 PyMOL 最终可视化？[y/N]（默认n）: " "n" || return 1
             [ "$RUN_PYMOL_FINAL_AFTER" -eq 1 ] && need_pymol_final=1
         fi
     fi
 
     if [ "$can_run_pymol_after_chimerax" -eq 1 ]; then
-        ask_yes_no_var RUN_PYMOL_FINAL_AFTER "ChimeraX 氢键分析完成后是否继续运行 PyMOL 最终可视化？[y/N]: " "n" || return 1
+        ask_yes_no_var RUN_PYMOL_FINAL_AFTER "ChimeraX 氢键分析完成后是否继续运行 PyMOL 最终可视化？[y/N]（默认n）: " "n" || return 1
         [ "$RUN_PYMOL_FINAL_AFTER" -eq 1 ] && need_pymol_final=1
     fi
 
@@ -1277,28 +1277,98 @@ def safe_name(text):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text))
 
 
-def list_new_objects(before):
-    after = set(cmd.get_object_list("all"))
-    return sorted(list(after - before))
+def _is_model_line(line):
+    return line.strip().upper().startswith("MODEL")
 
 
-def natural_key(s):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+def _is_endmdl_line(line):
+    return line.strip().upper().startswith("ENDMDL")
 
 
-def split_pose_object(multistate_obj, desired_pose, prefix):
-    before = set(cmd.get_object_list("all"))
-    cmd.split_states(multistate_obj, prefix=prefix)
-    created = list_new_objects(before)
-    created = sorted([x for x in created if x.startswith(prefix)], key=natural_key)
-    if not created:
-        raise RuntimeError(f"Could not split states for object: {multistate_obj}")
-    if desired_pose < 1 or desired_pose > len(created):
+def read_pdbqt_pose_blocks(pdbqt_file):
+    """
+    Read a Vina output PDBQT and return one text block per pose.
+
+    PyMOL can load PDBQT, but in some versions it does not convert Vina's
+    MODEL/ENDMDL sections into PyMOL states.  ChimeraX does, which is why the
+    same file can show 9 poses in ChimeraX while PyMOL reports only 1 state.
+    To avoid depending on PyMOL's state parser, we split the PDBQT ourselves.
+    """
+    path = Path(pdbqt_file)
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+    if not any(line.strip() for line in lines):
+        return []
+
+    blocks = []
+    current = []
+    preamble = []
+    in_model = False
+    saw_model = False
+
+    for line in lines:
+        if _is_model_line(line):
+            saw_model = True
+            if in_model and current:
+                blocks.append(current)
+            current = preamble + [line]
+            preamble = []
+            in_model = True
+            continue
+
+        if in_model:
+            current.append(line)
+            if _is_endmdl_line(line):
+                blocks.append(current)
+                current = []
+                in_model = False
+            continue
+
+        if not saw_model:
+            # Preserve comments/REMARKs before the first MODEL, if present.
+            preamble.append(line)
+
+    if in_model and current:
+        blocks.append(current)
+
+    # If the file is not MODEL/ENDMDL-style, treat the whole file as one pose.
+    if not saw_model:
+        return [lines]
+    return blocks
+
+
+def extract_pdbqt_pose_to_file(pdbqt_file, desired_pose, receptor, ligand):
+    """Extract desired Vina pose to a single-pose temporary PDBQT for PyMOL."""
+    blocks = read_pdbqt_pose_blocks(pdbqt_file)
+    pose_count = len(blocks)
+    if pose_count == 0:
+        raise RuntimeError(f"Docking PDBQT is empty or unreadable: {pdbqt_file}")
+    if desired_pose < 1 or desired_pose > pose_count:
         raise RuntimeError(
-            f"Requested pose {desired_pose}, but {multistate_obj} has only {len(created)} states"
+            f"Requested pose {desired_pose}, but PDBQT file has only {pose_count} MODEL pose(s): {pdbqt_file}"
         )
-    pose_obj = created[desired_pose - 1]
-    return pose_obj, created
+
+    # For a real single-pose file without MODEL records, loading it directly is fine.
+    if pose_count == 1 and not any(_is_model_line(line) for line in blocks[0]):
+        return Path(pdbqt_file), pose_count
+
+    pose_tmp_dir = Path(OUTPUT_DIR) / "_pymol_pose_extract"
+    pose_tmp_dir.mkdir(parents=True, exist_ok=True)
+    pose_file = pose_tmp_dir / f"{safe_name(receptor)}_{safe_name(ligand)}_pose{desired_pose}.pdbqt"
+    pose_file.write_text("".join(blocks[desired_pose - 1]), encoding="utf-8")
+    return pose_file, pose_count
+
+
+def load_selected_pdbqt_pose(pdbqt_file, desired_pose, pose_obj, receptor, ligand):
+    """Load exactly one selected Vina pose as a normal PyMOL object."""
+    pose_file, pose_count = extract_pdbqt_pose_to_file(pdbqt_file, desired_pose, receptor, ligand)
+    print(f"[INFO] Loading pose {desired_pose}/{pose_count} from {Path(pdbqt_file).name}")
+    cmd.load(str(pose_file), pose_obj)
+    atom_count = cmd.count_atoms(pose_obj)
+    if atom_count <= 0:
+        raise RuntimeError(
+            f"PyMOL loaded zero atoms for pose {desired_pose} from extracted file: {pose_file}"
+        )
+    return pose_file, pose_count
 
 
 def define_custom_colors():
@@ -1424,18 +1494,14 @@ def build_complex(record):
     clear_pymol_scene()
 
     receptor_obj = "receptor"
-    dock_obj = "dock_all"
+    pose_obj = "pose_selected"
     cmd.load(str(receptor_file), receptor_obj)
-    cmd.load(str(dock_file), dock_obj)
 
-    pose_prefix = "pose_"
-    pose_obj, split_objs = split_pose_object(dock_obj, pose, pose_prefix)
-
-    # Keep only receptor + desired pose
-    for obj in split_objs:
-        if obj != pose_obj:
-            cmd.delete(obj)
-    cmd.delete(dock_obj)
+    # Do not rely on PyMOL's PDBQT multi-state detection.  Some PyMOL builds load
+    # Vina MODEL/ENDMDL output as one state, causing pose 2/3/9 to be rejected even
+    # when the PDBQT really contains multiple poses.  Split the PDBQT text first and
+    # load only the selected pose as a single PyMOL object.
+    load_selected_pdbqt_pose(dock_file, pose, pose_obj, receptor, ligand)
 
     # Basic representation
     cmd.hide("everything", "all")
@@ -1809,7 +1875,14 @@ main_menu() {  # 主菜单
     echo " AutoDock 批处理工具"
     echo " 系统：$SYSTEM_TYPE"
     echo "========================================"
-    read -r -p "请选择流程：1) SDF → PDB（PyMOL）  2) PDB → PDBQT（MGLTools）  3) Vina 批量对接  4) 全流程（默认）  5) ChimeraX 氢键分析  6) PyMOL 可视化  0) 退出: " choice
+    echo "1) SDF → PDB（PyMOL）"
+    echo "2) PDB → PDBQT（MGLTools）"
+    echo "3) Vina 批量对接"
+    echo "4) 全流程"
+    echo "5) ChimeraX 氢键分析"
+    echo "6) PyMOL 可视化"
+    echo "0) 退出"
+    read -r -p "选择一个流程 [默认: 4]: " choice
     [ -z "$choice" ] && choice=4
     [ "$choice" = "0" ] && exit 0
     collect_all_inputs || exit 1
