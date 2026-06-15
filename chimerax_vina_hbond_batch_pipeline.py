@@ -45,13 +45,13 @@ WORK_DIR = r"[WORK DIR]"
 RECEPTOR_DIR = ""      # Empty = WORK_DIR
 DOCKING_DIR = ""       # Empty = WORK_DIR
 RECEPTORS = []         # Empty = auto-detect receptor_dir/*.pdbqt
-OUTPUT_TXT = ""        # Empty = docking_dir/vina_hbond_summary_with_progress.txt
+OUTPUT_TXT = ""        # Empty = docking_dir/vina_hbond_hydrophobic_summary.txt
 
 RELAX_HBOND_CRITERIA = True
 PRINT_EACH_POSE = True
 KEEP_HBOND_DETAIL_FILES = False
 CLOSE_ALL_AT_START = True
-DEFAULT_OUTPUT_FILENAME = "vina_hbond_summary_with_progress.txt"
+DEFAULT_OUTPUT_FILENAME = "vina_hbond_hydrophobic_summary.txt"
 
 # Operational definition of hydrophobic/aromatic contacts:
 # ligand carbon atoms within this distance (Angstrom) of receptor carbon atoms
