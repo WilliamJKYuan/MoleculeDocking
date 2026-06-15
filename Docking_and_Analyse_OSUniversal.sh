@@ -177,6 +177,13 @@ find_prepare_script() {  # 兼容 Windows 与 Linux 两种 MGLTools 目录结构
     return 1
 }
 
+find_prepare_receptor_script() {  # 兼容 Windows 与 Linux 两种 MGLTools 目录结构
+    local d="$1"
+    [ -f "$d/Lib/site-packages/AutoDockTools/Utilities24/prepare_receptor4.py" ] && echo "$d/Lib/site-packages/AutoDockTools/Utilities24/prepare_receptor4.py" && return 0
+    [ -f "$d/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_receptor4.py" ] && echo "$d/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_receptor4.py" && return 0
+    return 1
+}
+
 detect_mgltools_dir() {  # 自动搜索 MGLTools 根目录，不固定版本号
     local candidates=()
     if [ "$SYSTEM_TYPE" = "Linux" ]; then
@@ -213,6 +220,7 @@ collect_mgltools() {  # 只在参数收集阶段获取 MGLTools 根目录、prep
     [ -d "$MGLTOOLS_DIR" ] || { echo "错误: MGLTools 目录不存在: $MGLTOOLS_DIR"; return 1; }
     PREP_SCRIPT=$(find_prepare_script "$MGLTOOLS_DIR")
     [ -z "$PREP_SCRIPT" ] && { echo "错误: 找不到 prepare_ligand4.py"; return 1; }
+    PREP_RECEPTOR_SCRIPT=$(find_prepare_receptor_script "$MGLTOOLS_DIR" || true)
     unset MGL_PYTHON
     if [ "$SYSTEM_TYPE" = "Windows" ]; then
         [ -f "$MGLTOOLS_DIR/python.exe" ] && MGL_PYTHON="$MGLTOOLS_DIR/python.exe"
@@ -250,6 +258,82 @@ collect_vina_cmd() {  # 只在参数收集阶段获取 Vina 命令
         fi
     fi
     command -v "$VINA_CMD" >/dev/null 2>&1 || [ -f "$WORK_DIR_ABS/${VINA_CMD#./}" ] || [ -f "$VINA_CMD" ] || { echo "错误: 找不到 Vina: $VINA_CMD"; return 1; }
+}
+
+detect_p2rank_cmd() {  # 自动识别 P2Rank 启动脚本；Windows Git Bash 优先使用无后缀 prank
+    local candidates=() f
+    if [ -n "${P2RANK_HOME:-}" ]; then
+        candidates+=("$P2RANK_HOME/prank" "$P2RANK_HOME/prank.bat")
+    fi
+    candidates+=(
+        "$WORK_DIR_ABS/prank" "$WORK_DIR_ABS/prank.bat"
+        "$WORK_DIR_ABS/p2rank/prank" "$WORK_DIR_ABS/p2rank/prank.bat"
+        "$WORK_DIR_ABS"/p2rank_*/prank "$WORK_DIR_ABS"/p2rank_*/prank.bat
+        "$SCRIPT_DIR/prank" "$SCRIPT_DIR/prank.bat"
+        "$SCRIPT_DIR"/p2rank_*/prank "$SCRIPT_DIR"/p2rank_*/prank.bat
+    )
+    for f in "${candidates[@]}"; do
+        [ -f "$f" ] && echo "$f" && return 0
+    done
+    for f in prank prank.bat; do
+        if command -v "$f" >/dev/null 2>&1; then
+            command -v "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+collect_p2rank_cmd() {  # 只在参数收集阶段获取 P2Rank 命令
+    local p2rank_base p2rank_sibling
+    P2RANK_CMD=$(detect_p2rank_cmd || true)
+    if [ -n "$P2RANK_CMD" ]; then
+        echo "已找到 P2Rank: $P2RANK_CMD"
+    else
+        read -r -p "未找到 P2Rank。请输入 P2Rank 的 prank 路径（例如 D:\\p2rank_2.5.1\\prank，不建议使用 prank.bat）: " P2RANK_CMD
+        P2RANK_CMD=$(normalize_path "$P2RANK_CMD")
+        if [ -f "$WORK_DIR_ABS/$P2RANK_CMD" ]; then
+            P2RANK_CMD="$WORK_DIR_ABS/$P2RANK_CMD"
+        fi
+    fi
+    p2rank_base=$(basename "$P2RANK_CMD" | tr 'A-Z' 'a-z')
+    if [ "$SYSTEM_TYPE" = "Windows" ] && { [ "$p2rank_base" = "prank.bat" ] || [ "$p2rank_base" = "prank.cmd" ]; }; then
+        p2rank_sibling="${P2RANK_CMD%.*}"
+        if [ -f "$p2rank_sibling" ]; then
+            echo "检测到 bat/cmd 启动脚本，Git Bash 下将改用同目录无后缀 prank: $p2rank_sibling"
+            P2RANK_CMD="$p2rank_sibling"
+        elif command -v prank >/dev/null 2>&1; then
+            P2RANK_CMD=$(command -v prank)
+            echo "检测到 bat/cmd 启动脚本，Git Bash 下将改用 PATH 中的 prank: $P2RANK_CMD"
+        else
+            echo "错误: Git Bash 下请使用无后缀的 P2Rank 启动脚本 prank，不建议使用 prank.bat。"
+            return 1
+        fi
+    fi
+    command -v "$P2RANK_CMD" >/dev/null 2>&1 || [ -f "$P2RANK_CMD" ] || { echo "错误: 找不到 P2Rank: $P2RANK_CMD"; return 1; }
+}
+
+ask_number_var() {
+    local var_name="$1" prompt="$2" default_value="$3" input
+    read -r -p "$prompt" input
+    input=$(echo "$input" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -z "$input" ] && input="$default_value"
+    if ! [[ "$input" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "请输入数字。"
+        return 1
+    fi
+    printf -v "$var_name" '%s' "$input"
+}
+
+collect_p2rank_inputs() {
+    collect_p2rank_cmd || return 1
+    ask_output_dir_var P2RANK_OUT_DIR_ABS "请输入 P2Rank 预测结果文件夹（默认 工作文件夹/p2rank_results）: " "$WORK_DIR_ABS/p2rank_results" || return 1
+    ask_number_var P2RANK_BOX_SIZE "请输入 Vina 对接盒子边长 Å（默认 22）: " "22" || return 1
+    ask_number_var P2RANK_EXHAUSTIVENESS "请输入 Vina exhaustiveness（默认 16）: " "16" || return 1
+    ask_number_var P2RANK_NUM_MODES "请输入 Vina num_modes（默认 9）: " "9" || return 1
+    ask_number_var P2RANK_ENERGY_RANGE "请输入 Vina energy_range（默认 3）: " "3" || return 1
+    ask_yes_no_var P2RANK_USE_ALPHAFOLD "受体是否主要来自 AlphaFold/预测结构？[Y/n]（默认y）: " "y" || return 1
+    ask_yes_no_var P2RANK_OVERWRITE_CONFIGS "是否用 P2Rank 结果覆盖同名 Vina 配置文件？[Y/n]（默认y）: " "y" || return 1
 }
 
 ask_yes_no_var() {  # 统一询问 yes/no，结果写入变量: 1/0
@@ -420,7 +504,7 @@ ask_work_dir_once() {  # 工作目录只询问一次
 }
 
 collect_all_inputs() {  # 所有需要询问的内容集中放在正式运行之前
-    local need_pymol_sdf=0 need_pymol_final=0 need_mgl=0 need_vina=0 need_pdbqt=0 need_chimerax=0 can_run_chimerax_after=0 can_run_pymol_after_chimerax=0
+    local need_pymol_sdf=0 need_pymol_final=0 need_mgl=0 need_vina=0 need_pdbqt=0 need_receptor_pdbqt=0 need_p2rank=0 need_chimerax=0 can_run_chimerax_after=0 can_run_pymol_after_chimerax=0
     RUN_CHIMERAX_AFTER=0
     RUN_PYMOL_FINAL_AFTER=0
     case "$choice" in
@@ -452,8 +536,20 @@ collect_all_inputs() {  # 所有需要询问的内容集中放在正式运行之
     elif [ "$choice" = "3" ]; then
         ask_existing_dir_var RECEPTOR_DIR_ABS "请输入 Receptor 文件夹（默认 工作文件夹/receptor）: " "$WORK_DIR_ABS/receptor" || return 1
         ask_existing_dir_var VINA_LIGAND_DIR_ABS "请输入配体 PDBQT 文件夹（默认 工作文件夹/ligand）: " "$WORK_DIR_ABS/ligand" || return 1
-        ask_existing_dir_var CONFIG_DIR_ABS "请输入配置文件夹（默认 工作文件夹/dockingConfigs）: " "$WORK_DIR_ABS/dockingConfigs" || return 1
+        ask_output_dir_var CONFIG_DIR_ABS "请输入配置文件夹（默认 工作文件夹/dockingConfigs）: " "$WORK_DIR_ABS/dockingConfigs" || return 1
         ask_output_dir_var DOCK_OUT_DIR_ABS "请输入 Vina 结果输出文件夹（默认 工作文件夹/Docking_Results_Parallel）: " "$WORK_DIR_ABS/Docking_Results_Parallel" || return 1
+        ask_yes_no_var RUN_RECEPTOR_PDBQT_PREP "是否将受体 PDB 自动转换为 PDBQT？[y/N]（默认n）: " "n" || return 1
+        ask_yes_no_var RUN_P2RANK_BEFORE_VINA "是否先运行 P2Rank 预测口袋并自动生成 Vina 配置？[Y/n]（默认y）: " "y" || return 1
+        if [ "$RUN_RECEPTOR_PDBQT_PREP" -eq 1 ] || [ "$RUN_P2RANK_BEFORE_VINA" -eq 1 ]; then
+            ask_existing_dir_var RECEPTOR_PDB_DIR_ABS "请输入受体 PDB 文件夹（默认 Receptor 文件夹）: " "$RECEPTOR_DIR_ABS" || return 1
+        fi
+        if [ "$RUN_RECEPTOR_PDBQT_PREP" -eq 1 ]; then
+            need_mgl=1
+            need_receptor_pdbqt=1
+        fi
+        if [ "$RUN_P2RANK_BEFORE_VINA" -eq 1 ]; then
+            need_p2rank=1
+        fi
     elif [ "$choice" = "4" ]; then
         ask_existing_dir_var LIGAND_DIR_ABS "请输入 Ligand 原始文件夹（默认 工作文件夹/ligand）: " "$WORK_DIR_ABS/ligand" || return 1
         SDF_INPUT_DIR_ABS="$LIGAND_DIR_ABS"
@@ -463,8 +559,20 @@ collect_all_inputs() {  # 所有需要询问的内容集中放在正式运行之
         VINA_LIGAND_DIR_ABS="$PDBQT_OUT_DIR_ABS"
         echo "Vina 配体文件夹将使用 PDBQT 输出文件夹: $VINA_LIGAND_DIR_ABS"
         ask_existing_dir_var RECEPTOR_DIR_ABS "请输入 Receptor 文件夹（默认 工作文件夹/receptor）: " "$WORK_DIR_ABS/receptor" || return 1
-        ask_existing_dir_var CONFIG_DIR_ABS "请输入配置文件夹（默认 工作文件夹/dockingConfigs）: " "$WORK_DIR_ABS/dockingConfigs" || return 1
+        ask_output_dir_var CONFIG_DIR_ABS "请输入配置文件夹（默认 工作文件夹/dockingConfigs）: " "$WORK_DIR_ABS/dockingConfigs" || return 1
         ask_output_dir_var DOCK_OUT_DIR_ABS "请输入 Vina 结果输出文件夹（默认 工作文件夹/Docking_Results_Parallel）: " "$WORK_DIR_ABS/Docking_Results_Parallel" || return 1
+        ask_yes_no_var RUN_RECEPTOR_PDBQT_PREP "是否将受体 PDB 自动转换为 PDBQT？[y/N]（默认n）: " "n" || return 1
+        ask_yes_no_var RUN_P2RANK_BEFORE_VINA "是否先运行 P2Rank 预测口袋并自动生成 Vina 配置？[Y/n]（默认y）: " "y" || return 1
+        if [ "$RUN_RECEPTOR_PDBQT_PREP" -eq 1 ] || [ "$RUN_P2RANK_BEFORE_VINA" -eq 1 ]; then
+            ask_existing_dir_var RECEPTOR_PDB_DIR_ABS "请输入受体 PDB 文件夹（默认 Receptor 文件夹）: " "$RECEPTOR_DIR_ABS" || return 1
+        fi
+        if [ "$RUN_RECEPTOR_PDBQT_PREP" -eq 1 ]; then
+            need_mgl=1
+            need_receptor_pdbqt=1
+        fi
+        if [ "$RUN_P2RANK_BEFORE_VINA" -eq 1 ]; then
+            need_p2rank=1
+        fi
     elif [ "$choice" = "5" ]; then
         ask_existing_dir_var RECEPTOR_DIR_ABS "请输入 Receptor 文件夹（默认 工作文件夹/receptor）: " "$WORK_DIR_ABS/receptor" || return 1
         ask_existing_dir_var DOCK_OUT_DIR_ABS "请输入 Vina 结果文件夹（默认 工作文件夹/Docking_Results_Parallel）: " "$WORK_DIR_ABS/Docking_Results_Parallel" || return 1
@@ -504,12 +612,23 @@ collect_all_inputs() {  # 所有需要询问的内容集中放在正式运行之
         collect_mgltools || return 1
     fi
 
+    if [ "$need_receptor_pdbqt" -eq 1 ] && [ -z "${PREP_RECEPTOR_SCRIPT:-}" ]; then
+        echo "错误: 当前 MGLTools 目录中找不到 prepare_receptor4.py，无法自动转换受体 PDB。"
+        return 1
+    fi
+
     if [ "$need_vina" -eq 1 ]; then
         collect_vina_cmd || return 1
     fi
 
-    if [ "$need_pdbqt" -eq 1 ] || [ "$need_vina" -eq 1 ]; then
-        ask_parallel_jobs "$need_pdbqt" "$need_vina" || return 1
+    if [ "$need_p2rank" -eq 1 ]; then
+        collect_p2rank_inputs || return 1
+    fi
+
+    if [ "$need_pdbqt" -eq 1 ] || [ "$need_receptor_pdbqt" -eq 1 ] || [ "$need_vina" -eq 1 ]; then
+        local any_pdbqt="$need_pdbqt"
+        [ "$need_receptor_pdbqt" -eq 1 ] && any_pdbqt=1
+        ask_parallel_jobs "$any_pdbqt" "$need_vina" || return 1
     fi
 
     if [ "$need_chimerax" -eq 1 ]; then
@@ -528,10 +647,20 @@ collect_all_inputs() {  # 所有需要询问的内容集中放在正式运行之
     [ -n "${PDB_OUT_DIR_ABS:-}" ] && echo "PDB输出目录: $PDB_OUT_DIR_ABS"
     [ -n "${PDBQT_OUT_DIR_ABS:-}" ] && echo "PDBQT输出目录: $PDBQT_OUT_DIR_ABS"
     [ -n "${RECEPTOR_DIR_ABS:-}" ] && echo "受体目录: $RECEPTOR_DIR_ABS"
+    [ -n "${RECEPTOR_PDB_DIR_ABS:-}" ] && echo "受体PDB目录: $RECEPTOR_PDB_DIR_ABS"
     [ -n "${VINA_LIGAND_DIR_ABS:-}" ] && echo "Vina配体目录: $VINA_LIGAND_DIR_ABS"
     [ -n "${CONFIG_DIR_ABS:-}" ] && echo "配置目录: $CONFIG_DIR_ABS"
     [ -n "${DOCK_OUT_DIR_ABS:-}" ] && echo "Vina结果输出目录: $DOCK_OUT_DIR_ABS"
     [ -n "${COMMON_MAX_JOBS:-}" ] && echo "最大并行任务数: $COMMON_MAX_JOBS"
+    if [ "${need_receptor_pdbqt:-0}" -eq 1 ]; then
+        echo "受体PDB→PDBQT: 是"
+    fi
+    if [ "${need_p2rank:-0}" -eq 1 ]; then
+        echo "P2Rank预测口袋: 是"
+        echo "P2Rank程序: $P2RANK_CMD"
+        echo "P2Rank输出目录: $P2RANK_OUT_DIR_ABS"
+        echo "Vina自动盒子边长: $P2RANK_BOX_SIZE Å"
+    fi
     if [ "${need_chimerax:-0}" -eq 1 ]; then
         echo "ChimeraX分析: 是"
         echo "ChimeraX程序: $CHIMERAX_CMD"
@@ -674,6 +803,278 @@ step_pdb_to_pdbqt() {  # Step 2: 用 MGLTools 将 PDB 批量转成 PDBQT
     fail_count=$(wc -l < "$failed_list" | tr -d ' ')
     echo "PDBQT转换结束: 成功 $((n - fail_count)) / $n"
     [ "$fail_count" -gt 0 ] && echo "失败列表: $failed_list"
+    return 0
+}
+
+step_receptor_pdb_to_pdbqt() {  # 可选步骤: 用 MGLTools 将受体 PDB 批量转成 PDBQT
+    cd "$RECEPTOR_PDB_DIR_ABS" || return 1
+    shopt -s nullglob
+    local pdb_files=(*.pdb)
+    local n=${#pdb_files[@]}
+    [ "$n" -eq 0 ] && { echo "错误: 在 $RECEPTOR_PDB_DIR_ABS 中没有找到 .pdb 受体文件"; return 1; }
+    [ -n "${PREP_RECEPTOR_SCRIPT:-}" ] && [ -f "$PREP_RECEPTOR_SCRIPT" ] || { echo "错误: 找不到 prepare_receptor4.py"; return 1; }
+
+    local log_dir="$RECEPTOR_DIR_ABS/_prep_receptor_logs"
+    local failed_list="$log_dir/_failed_receptors.txt"
+    local prep_tool max_jobs
+    mkdir -p "$log_dir" "$RECEPTOR_DIR_ABS"
+    : > "$failed_list"
+    prep_tool=$(to_native_path "$PREP_RECEPTOR_SCRIPT")
+    max_jobs="$PDBQT_MAX_JOBS"
+
+    run_receptor_prep_one() {
+        local pdb="$1"
+        local name="${pdb%.pdb}"
+        local out_mgl log
+        out_mgl=$(to_native_path "$RECEPTOR_DIR_ABS/${name}.pdbqt")
+        log="$log_dir/${name}_prepare_receptor.log"
+        (cd "$RECEPTOR_PDB_DIR_ABS" && "$MGL_PYTHON" "$prep_tool" -r "$pdb" -o "$out_mgl" -A hydrogens > "$log" 2>&1)
+        if [ "$?" -eq 0 ]; then
+            echo "[OK] receptor ${name}.pdbqt"
+        else
+            echo "[FAILED] receptor $pdb | log: $log"
+            echo "$pdb" >> "$failed_list"
+        fi
+    }
+
+    bar
+    echo "受体PDB目录: $RECEPTOR_PDB_DIR_ABS"
+    echo "受体PDBQT输出目录: $RECEPTOR_DIR_ABS"
+    echo "受体PDB数量: $n"
+    echo "并行数: $max_jobs"
+    echo "日志目录: $log_dir"
+    bar
+    for pdb in "${pdb_files[@]}"; do
+        run_receptor_prep_one "$pdb" &
+        while [ "$(jobs -rp | wc -l)" -ge "$max_jobs" ]; do sleep 0.3; done
+    done
+    wait
+    local fail_count
+    fail_count=$(wc -l < "$failed_list" | tr -d ' ')
+    echo "受体PDBQT转换结束: 成功 $((n - fail_count)) / $n"
+    [ "$fail_count" -gt 0 ] && echo "失败列表: $failed_list"
+    [ "$fail_count" -gt 0 ] && return 1
+    return 0
+}
+
+step_p2rank_generate_configs() {  # 可选步骤: P2Rank预测口袋，并用rank 1口袋生成Vina配置
+    cd "$WORK_DIR_ABS" || return 1
+    [ -n "${P2RANK_CMD:-}" ] || { echo "错误: 未设置 P2Rank 程序路径"; return 1; }
+    [ -d "$RECEPTOR_PDB_DIR_ABS" ] || { echo "错误: 受体PDB目录不存在: $RECEPTOR_PDB_DIR_ABS"; return 1; }
+    mkdir -p "$P2RANK_OUT_DIR_ABS" "$CONFIG_DIR_ABS" || return 1
+
+    shopt -s nullglob
+    local receptor_pdbs=("$RECEPTOR_PDB_DIR_ABS"/*.pdb)
+    local n=${#receptor_pdbs[@]}
+    [ "$n" -eq 0 ] && { echo "错误: 在 $RECEPTOR_PDB_DIR_ABS 中没有找到 .pdb 受体文件，P2Rank无法预测。"; return 1; }
+
+    local p2rank_exec p2rank_dir p2rank_runner pdb_file pdb_native rec_name rec_out_dir p2rank_native p2rank_args exit_code
+    p2rank_exec="$P2RANK_CMD"
+    if [ -f "$p2rank_exec" ]; then
+        p2rank_dir=$(cd "$(dirname "$p2rank_exec")" >/dev/null 2>&1 && pwd)
+        p2rank_runner="./$(basename "$p2rank_exec")"
+    else
+        p2rank_dir="$WORK_DIR_ABS"
+        p2rank_runner="$p2rank_exec"
+    fi
+    if [ "$SYSTEM_TYPE" = "Linux" ] && [ -f "$p2rank_exec" ]; then
+        chmod +x "$p2rank_exec" 2>/dev/null
+    fi
+    if [ -f "$p2rank_exec" ] && [ ! -d "$p2rank_dir" ]; then
+        echo "错误: P2Rank程序目录不存在: $p2rank_dir"
+        return 1
+    fi
+
+    bar
+    echo "开始 P2Rank 口袋预测"
+    echo "P2Rank程序目录: $p2rank_dir"
+    echo "受体PDB目录: $RECEPTOR_PDB_DIR_ABS"
+    echo "P2Rank输出目录: $P2RANK_OUT_DIR_ABS"
+    echo "配置输出目录: $CONFIG_DIR_ABS"
+    echo "受体数量: $n"
+    bar
+
+    for pdb_file in "${receptor_pdbs[@]}"; do
+        rec_name=$(basename "$pdb_file" .pdb)
+        rec_out_dir="$P2RANK_OUT_DIR_ABS/$rec_name"
+        mkdir -p "$rec_out_dir"
+        pdb_native=$(to_native_path "$pdb_file")
+        p2rank_native=$(to_native_path "$rec_out_dir")
+        p2rank_args=(predict -f "$pdb_native" -o "$p2rank_native")
+        [ "${P2RANK_USE_ALPHAFOLD:-1}" -eq 1 ] && p2rank_args+=(-c alphafold)
+
+        echo ">>> P2Rank预测: $rec_name"
+        (cd "$p2rank_dir" && "$p2rank_runner" "${p2rank_args[@]}")
+        exit_code=$?
+        if [ "$exit_code" -ne 0 ]; then
+            echo "错误: P2Rank预测失败: $rec_name"
+            return "$exit_code"
+        fi
+    done
+
+    local py_script="$WORK_DIR_ABS/_p2rank_to_vina_config_temp.py"
+    local p2rank_out_for_python config_dir_for_python
+    p2rank_out_for_python=$(to_native_path "$P2RANK_OUT_DIR_ABS")
+    config_dir_for_python=$(to_native_path "$CONFIG_DIR_ABS")
+    cat > "$py_script" <<PYEOF
+# -*- coding: utf-8 -*-
+import csv
+import os
+import re
+import sys
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+p2rank_root = Path(r'''$p2rank_out_for_python''')
+config_dir = Path(r'''$config_dir_for_python''')
+box_size = float(r'''$P2RANK_BOX_SIZE''')
+exhaustiveness = r'''$P2RANK_EXHAUSTIVENESS'''
+num_modes = r'''$P2RANK_NUM_MODES'''
+energy_range = r'''$P2RANK_ENERGY_RANGE'''
+overwrite = str(r'''${P2RANK_OVERWRITE_CONFIGS:-1}''') == "1"
+
+def norm_key(key):
+    return re.sub(r"[^a-z0-9]", "", key.lower())
+
+def find_col(fieldnames, candidates):
+    normalized = {norm_key(k): k for k in fieldnames or []}
+    for cand in candidates:
+        hit = normalized.get(norm_key(cand))
+        if hit:
+            return hit
+    for k in fieldnames or []:
+        nk = norm_key(k)
+        for cand in candidates:
+            if norm_key(cand) in nk:
+                return k
+    return None
+
+def as_float(value):
+    return float(str(value).strip())
+
+def pick_prediction_csv(folder):
+    preferred = sorted(folder.glob("*_predictions.csv"))
+    if preferred:
+        return preferred[0]
+    fallback = sorted(folder.glob("*predictions*.csv"))
+    return fallback[0] if fallback else None
+
+def best_row(rows, rank_col, score_col, prob_col):
+    if not rows:
+        return None
+    if rank_col:
+        ranked = []
+        for row in rows:
+            try:
+                ranked.append((float(row.get(rank_col, "")), row))
+            except Exception:
+                pass
+        if ranked:
+            return sorted(ranked, key=lambda x: x[0])[0][1]
+    for col in (score_col, prob_col):
+        if col:
+            scored = []
+            for row in rows:
+                try:
+                    scored.append((float(row.get(col, "")), row))
+                except Exception:
+                    pass
+            if scored:
+                return sorted(scored, key=lambda x: x[0], reverse=True)[0][1]
+    return rows[0]
+
+ok = 0
+failed = 0
+config_dir.mkdir(parents=True, exist_ok=True)
+
+for rec_dir in sorted([p for p in p2rank_root.iterdir() if p.is_dir()]):
+    rec_name = rec_dir.name
+    csv_path = pick_prediction_csv(rec_dir)
+    if csv_path is None:
+        print(f"[FAILED] {rec_name}: no P2Rank predictions csv found")
+        failed += 1
+        continue
+
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    x_col = find_col(fieldnames, ["center_x", "center x", "x"])
+    y_col = find_col(fieldnames, ["center_y", "center y", "y"])
+    z_col = find_col(fieldnames, ["center_z", "center z", "z"])
+    rank_col = find_col(fieldnames, ["rank"])
+    score_col = find_col(fieldnames, ["score"])
+    prob_col = find_col(fieldnames, ["probability", "prob"])
+
+    if not (x_col and y_col and z_col):
+        print(f"[FAILED] {rec_name}: cannot find center_x/center_y/center_z columns in {csv_path.name}")
+        failed += 1
+        continue
+
+    row = best_row(rows, rank_col, score_col, prob_col)
+    if row is None:
+        print(f"[FAILED] {rec_name}: empty predictions csv")
+        failed += 1
+        continue
+
+    try:
+        cx = as_float(row[x_col])
+        cy = as_float(row[y_col])
+        cz = as_float(row[z_col])
+    except Exception as exc:
+        print(f"[FAILED] {rec_name}: invalid pocket center values: {exc}")
+        failed += 1
+        continue
+
+    out = config_dir / f"{rec_name}_vinaConfig.txt"
+    if out.exists() and not overwrite:
+        print(f"[SKIP] {rec_name}: config exists: {out}")
+        continue
+
+    ligand_placeholder = "__LIGAND_WILL_BE_REPLACED_BY_PIPELINE__"
+    text = "\n".join([
+        f"receptor = {rec_name}.pdbqt",
+        f"ligand = {ligand_placeholder}",
+        "",
+        f"center_x = {cx:.3f}",
+        f"center_y = {cy:.3f}",
+        f"center_z = {cz:.3f}",
+        "",
+        f"size_x = {box_size:g}",
+        f"size_y = {box_size:g}",
+        f"size_z = {box_size:g}",
+        "",
+        f"exhaustiveness = {exhaustiveness}",
+        f"num_modes = {num_modes}",
+        f"energy_range = {energy_range}",
+        "",
+    ])
+    out.write_text(text, encoding="utf-8")
+    rank_info = row.get(rank_col, "1") if rank_col else "best"
+    print(f"[OK] {rec_name}: rank={rank_info}, center=({cx:.3f}, {cy:.3f}, {cz:.3f}) -> {out}")
+    ok += 1
+
+print(f"P2Rank配置生成结束: 成功 {ok}, 失败 {failed}")
+sys.exit(1 if failed else 0)
+PYEOF
+
+    local python_cmd
+    python_cmd=$(command -v python 2>/dev/null || command -v python3 2>/dev/null || command -v py 2>/dev/null || true)
+    [ -z "$python_cmd" ] && { echo "错误: 找不到 Python，无法解析 P2Rank 结果并生成 Vina 配置。"; rm -f "$py_script"; return 1; }
+    if [[ "$(basename "$python_cmd")" = "py" || "$(basename "$python_cmd")" = "py.exe" ]]; then
+        "$python_cmd" -3 "$py_script"
+    else
+        "$python_cmd" "$py_script"
+    fi
+    exit_code=$?
+    rm -f "$py_script"
+    [ "$exit_code" -ne 0 ] && return "$exit_code"
     return 0
 }
 
@@ -1827,14 +2228,20 @@ step_pymol_final_visualization() {  # Step 5/6: 根据ChimeraX汇总结果批量
 
 run_all() {  # 全流程串联运行，中途任一步失败就停止
     if [ "${RUN_CHIMERAX_AFTER:-0}" -eq 1 ] && [ "${RUN_PYMOL_FINAL_AFTER:-0}" -eq 1 ]; then
-        echo "将依次运行: SDF→PDB、PDB→PDBQT、Vina对接、ChimeraX氢键分析、PyMOL最终可视化"
+        echo "将依次运行: SDF→PDB、配体PDB→PDBQT、可选受体处理、Vina对接、ChimeraX氢键分析、PyMOL最终可视化"
     elif [ "${RUN_CHIMERAX_AFTER:-0}" -eq 1 ]; then
-        echo "将依次运行: SDF→PDB、PDB→PDBQT、Vina对接、ChimeraX氢键分析"
+        echo "将依次运行: SDF→PDB、配体PDB→PDBQT、可选受体处理、Vina对接、ChimeraX氢键分析"
     else
-        echo "将依次运行: SDF→PDB、PDB→PDBQT、Vina对接"
+        echo "将依次运行: SDF→PDB、配体PDB→PDBQT、可选受体处理、Vina对接"
     fi
     step_sdf_to_pdb || return 1
     step_pdb_to_pdbqt || return 1
+    if [ "${RUN_RECEPTOR_PDBQT_PREP:-0}" -eq 1 ]; then
+        step_receptor_pdb_to_pdbqt || return 1
+    fi
+    if [ "${RUN_P2RANK_BEFORE_VINA:-0}" -eq 1 ]; then
+        step_p2rank_generate_configs || return 1
+    fi
     step_vina_docking || return 1
     if [ "${RUN_CHIMERAX_AFTER:-0}" -eq 1 ]; then
         step_chimerax_analysis || return 1
@@ -1849,6 +2256,12 @@ execute_choice() {
         1) step_sdf_to_pdb ;;
         2) step_pdb_to_pdbqt ;;
         3)
+            if [ "${RUN_RECEPTOR_PDBQT_PREP:-0}" -eq 1 ]; then
+                step_receptor_pdb_to_pdbqt || return 1
+            fi
+            if [ "${RUN_P2RANK_BEFORE_VINA:-0}" -eq 1 ]; then
+                step_p2rank_generate_configs || return 1
+            fi
             step_vina_docking || return 1
             if [ "${RUN_CHIMERAX_AFTER:-0}" -eq 1 ]; then
                 step_chimerax_analysis || return 1
