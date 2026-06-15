@@ -1821,7 +1821,7 @@ main_menu() {  # 主菜单
     echo "3) Vina 批量对接"
     echo "4) 全流程"
     echo "5) ChimeraX 氢键分析"
-    echo "6) PyMOL 最终可视化（读取ChimeraX结果，输出到Final）"
+    echo "6) PyMOL 可视化"
     echo "0) 退出"
     read -r -p "选择一个流程 [默认: 4]: " choice
     [ -z "$choice" ] && choice=4
