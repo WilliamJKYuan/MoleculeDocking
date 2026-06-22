@@ -45,8 +45,8 @@ OUT_DIR="./LigPlot_Batch_Results"
 #      ./batch_ligplot_vina_hbplus_autoos_with_list.sh "/f/SciApp/LigPlus"
 #
 # Windows 路径支持两种写法：
-#   CMD:      F:\SciApp\LigPlus
-#   Git Bash: /f/SciApp/LigPlus
+#   CMD 风格:      F:\SciApp\LigPlus
+#   Git Bash 风格: /f/SciApp/LigPlus
 DEFAULT_LIGPLUS_DIR="/f/SciApp/LigPlus"
 
 # 是否运行时询问 LigPlus 根目录
@@ -1047,17 +1047,36 @@ selected = []
 for key in sorted(groups.keys()):
     candidates = groups[key]
 
-    # 标准 1：如果有氢键，则只在有氢键的 pose 中选结合能最低者
+    # 新筛选逻辑：
+    # 1）先找 Receptor-Ligand 组合中结合能最低的 pose
+    # 2）再找有氢键的 pose 中结合能最低的
+    # 3）如果“最佳有氢键 pose”的结合能与“全局最低结合能 pose”的差值 < 1 kcal/mol，则选有氢键的
+    # 4）否则选全局最低结合能 pose
+
+    lowest_energy_pose = min(
+        candidates,
+        key=lambda r: (r["_energy_float"], int(r.get("Pose") or 999999))
+    )
+
     hb_candidates = [
         r for r in candidates
         if not is_missing_interaction(r.get("Hydrogen_bond_residues"))
     ]
 
     if hb_candidates:
-        best = min(hb_candidates, key=lambda r: (r["_energy_float"], int(r.get("Pose") or 999999)))
+        best_hbond_pose = min(
+            hb_candidates,
+            key=lambda r: (r["_energy_float"], int(r.get("Pose") or 999999))
+        )
+
+        energy_gap = best_hbond_pose["_energy_float"] - lowest_energy_pose["_energy_float"]
+
+        if energy_gap < 1.0:
+            best = best_hbond_pose
+        else:
+            best = lowest_energy_pose
     else:
-        # 标准 2：如果没有氢键，则在全部 pose 中选结合能最低者
-        best = min(candidates, key=lambda r: (r["_energy_float"], int(r.get("Pose") or 999999)))
+        best = lowest_energy_pose
 
     selected.append(best)
 
